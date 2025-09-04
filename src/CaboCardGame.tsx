@@ -58,16 +58,64 @@ interface ServerMessage {
   playerId?: string;
 }
 
-// Shared game storage - this will be shared across all MockWebSocket instances
-const sharedGameStorage = new Map<string, Game>();
+// Global game storage that persists across component instances
+const globalGameStorage = new Map<string, Game>();
 
-// Mock WebSocket class
+// Global event emitter for cross-component communication
+class GameEventEmitter {
+  private listeners: { [key: string]: Array<(data: any) => void> } = {};
+
+  on(event: string, callback: (data: any) => void) {
+    if (!this.listeners[event]) {
+      this.listeners[event] = [];
+    }
+    this.listeners[event].push(callback);
+  }
+
+  off(event: string, callback: (data: any) => void) {
+    if (this.listeners[event]) {
+      this.listeners[event] = this.listeners[event].filter(cb => cb !== callback);
+    }
+  }
+
+  emit(event: string, data: any) {
+    if (this.listeners[event]) {
+      this.listeners[event].forEach(callback => callback(data));
+    }
+  }
+}
+
+const gameEventEmitter = new GameEventEmitter();
+
+// Mock WebSocket class with global state synchronization
 class MockWebSocket {
   public onmessage: ((event: { data: string }) => void) | null = null;
+  private instanceId: string;
+
+  constructor() {
+    this.instanceId = Math.random().toString(36);
+    
+    // Listen for global game updates
+    gameEventEmitter.on('gameUpdated', (data) => {
+      // Don't send update back to the instance that created it
+      if (data.sourceInstanceId !== this.instanceId && this.onmessage) {
+        this.onmessage({
+          data: JSON.stringify(data.message)
+        });
+      }
+    });
+  }
 
   send(data: string): void {
     const message: ServerMessage = JSON.parse(data);
     setTimeout(() => this.handleMessage(message), 100);
+  }
+
+  private broadcastUpdate(message: ServerMessage): void {
+    gameEventEmitter.emit('gameUpdated', {
+      message,
+      sourceInstanceId: this.instanceId
+    });
   }
 
   private handleMessage(message: ServerMessage): void {
@@ -106,17 +154,21 @@ class MockWebSocket {
       discardPile: [],
       round: 1
     };
-    sharedGameStorage.set(code, game);
+    
+    globalGameStorage.set(code, game);
 
-    this.sendMessage({
-      type: 'GAME_CREATED',
+    const response = {
+      type: 'GAME_CREATED' as MessageType,
       gameCode: code,
       game: game
-    });
+    };
+
+    this.sendMessage(response);
+    this.broadcastUpdate(response);
   }
 
   private joinGame(message: ServerMessage): void {
-    const game = sharedGameStorage.get(message.gameCode!);
+    const game = globalGameStorage.get(message.gameCode!);
     if (!game) {
       this.sendMessage({
         type: 'ERROR',
@@ -133,7 +185,6 @@ class MockWebSocket {
       return;
     }
 
-    // Check if player name already exists in the game
     if (game.players.some(p => p.name === message.playerName)) {
       this.sendMessage({
         type: 'ERROR',
@@ -151,14 +202,19 @@ class MockWebSocket {
       canSeeCorners: false
     });
 
-    this.sendMessage({
-      type: 'GAME_JOINED',
+    globalGameStorage.set(message.gameCode!, game);
+
+    const response = {
+      type: 'GAME_JOINED' as MessageType,
       game: game
-    });
+    };
+
+    this.sendMessage(response);
+    this.broadcastUpdate(response);
   }
 
   private startGame(message: ServerMessage): void {
-    const game = sharedGameStorage.get(message.gameCode!);
+    const game = globalGameStorage.get(message.gameCode!);
     if (!game || game.players.length < 2) return;
 
     game.state = 'playing';
@@ -176,10 +232,15 @@ class MockWebSocket {
       player.canSeeCorners = true;
     });
 
-    this.sendMessage({
-      type: 'GAME_STARTED',
+    globalGameStorage.set(message.gameCode!, game);
+
+    const response = {
+      type: 'GAME_STARTED' as MessageType,
       game: game
-    });
+    };
+
+    this.sendMessage(response);
+    this.broadcastUpdate(response);
   }
 
   private createDeck(): Card[] {
@@ -193,7 +254,6 @@ class MockWebSocket {
       });
     });
 
-    // Shuffle deck
     for (let i = deck.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -203,9 +263,9 @@ class MockWebSocket {
   }
 
   private leaveGame(message: ServerMessage): void {
-    this.sendMessage({
-      type: 'GAME_LEFT'
-    });
+    const response = { type: 'GAME_LEFT' as MessageType };
+    this.sendMessage(response);
+    this.broadcastUpdate(response);
   }
 
   private sendMessage(message: ServerMessage): void {
@@ -333,10 +393,13 @@ const MenuScreen: React.FC<{
       </div>
       
       <div style={{ background: '#e6fffa', padding: '15px', borderRadius: '10px', fontSize: '14px', color: '#234e52' }}>
-        <strong>Debug Info:</strong> Active games in storage: {sharedGameStorage.size}
-        {sharedGameStorage.size > 0 && (
-          <div>Game codes: {Array.from(sharedGameStorage.keys()).join(', ')}</div>
+        <strong>Debug Info:</strong> Active games: {globalGameStorage.size}
+        {globalGameStorage.size > 0 && (
+          <div>Game codes: {Array.from(globalGameStorage.keys()).join(', ')}</div>
         )}
+        <div style={{ marginTop: '10px', fontSize: '12px' }}>
+          💡 <strong>Testing Tip:</strong> Open multiple browser tabs/windows and they should share the same game state!
+        </div>
       </div>
     </div>
   );
@@ -584,7 +647,7 @@ const CaboCardGame: React.FC = () => {
       const message: ServerMessage = JSON.parse(event.data);
       handleServerMessage(message);
     };
-  }, []);
+  }, [ws]);
 
   const handleServerMessage = (message: ServerMessage) => {
     switch (message.type) {
@@ -624,7 +687,7 @@ const CaboCardGame: React.FC = () => {
   };
 
   const handleCreateGame = (playerName: string) => {
-    const playerId = 'player_' + Date.now();
+    const playerId = 'player_' + Date.now() + '_' + Math.random().toString(36).substring(7);
     setGameState(prev => ({
       ...prev,
       playerName,
@@ -640,7 +703,7 @@ const CaboCardGame: React.FC = () => {
   };
 
   const handleJoinGame = (playerName: string, gameCode: string) => {
-    const playerId = 'player_' + Date.now();
+    const playerId = 'player_' + Date.now() + '_' + Math.random().toString(36).substring(7);
     setGameState(prev => ({
       ...prev,
       playerName,
