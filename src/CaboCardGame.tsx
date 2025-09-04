@@ -58,9 +58,11 @@ interface ServerMessage {
   playerId?: string;
 }
 
+// Shared game storage - this will be shared across all MockWebSocket instances
+const sharedGameStorage = new Map<string, Game>();
+
 // Mock WebSocket class
 class MockWebSocket {
-  private games = new Map<string, Game>();
   public onmessage: ((event: { data: string }) => void) | null = null;
 
   send(data: string): void {
@@ -104,7 +106,7 @@ class MockWebSocket {
       discardPile: [],
       round: 1
     };
-    this.games.set(code, game);
+    sharedGameStorage.set(code, game);
 
     this.sendMessage({
       type: 'GAME_CREATED',
@@ -114,7 +116,7 @@ class MockWebSocket {
   }
 
   private joinGame(message: ServerMessage): void {
-    const game = this.games.get(message.gameCode!);
+    const game = sharedGameStorage.get(message.gameCode!);
     if (!game) {
       this.sendMessage({
         type: 'ERROR',
@@ -127,6 +129,15 @@ class MockWebSocket {
       this.sendMessage({
         type: 'ERROR',
         message: 'Game is full'
+      });
+      return;
+    }
+
+    // Check if player name already exists in the game
+    if (game.players.some(p => p.name === message.playerName)) {
+      this.sendMessage({
+        type: 'ERROR',
+        message: 'Player name already taken in this game'
       });
       return;
     }
@@ -147,7 +158,7 @@ class MockWebSocket {
   }
 
   private startGame(message: ServerMessage): void {
-    const game = this.games.get(message.gameCode!);
+    const game = sharedGameStorage.get(message.gameCode!);
     if (!game || game.players.length < 2) return;
 
     game.state = 'playing';
@@ -320,6 +331,13 @@ const MenuScreen: React.FC<{
           <div><strong>Q,Black K:</strong> Look & choose to switch</div>
         </div>
       </div>
+      
+      <div style={{ background: '#e6fffa', padding: '15px', borderRadius: '10px', fontSize: '14px', color: '#234e52' }}>
+        <strong>Debug Info:</strong> Active games in storage: {sharedGameStorage.size}
+        {sharedGameStorage.size > 0 && (
+          <div>Game codes: {Array.from(sharedGameStorage.keys()).join(', ')}</div>
+        )}
+      </div>
     </div>
   );
 };
@@ -340,7 +358,7 @@ const LobbyScreen: React.FC<{
       </div>
       
       <div style={{ textAlign: 'center', padding: '15px', background: '#e6fffa', border: '2px solid #38b2ac', borderRadius: '10px', margin: '20px 0', fontWeight: 'bold', color: '#234e52' }}>
-        Waiting for players to join...
+        Waiting for players to join... ({game.players.length}/8 players)
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px', margin: '20px 0' }}>
