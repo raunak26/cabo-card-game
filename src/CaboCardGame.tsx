@@ -24,6 +24,10 @@ interface Game {
   deck: Card[];
   discardPile: Card[];
   round: number;
+  drawnCard: Card | null;
+  currentPlayerId: string | null;
+  caboCallerId: string | null;
+  turnsAfterCabo: number;
 }
 
 interface GameState {
@@ -35,18 +39,36 @@ interface GameState {
   currentGame: Game | null;
   selectedCard: number | null;
   drawnCard: Card | null;
+  peekedCards: Map<string, Card>;
+  showSpecialPowerMenu: boolean;
 }
 
 type MessageType = 
   | 'CREATE_GAME' 
   | 'JOIN_GAME' 
   | 'START_GAME' 
+  | 'DRAW_CARD'
+  | 'TAKE_DISCARD'
+  | 'REPLACE_CARD'
+  | 'DISCARD_DRAWN'
+  | 'CALL_CABO'
+  | 'PEEK_OWN_CARD'
+  | 'PEEK_OPPONENT_CARD'
+  | 'SWITCH_CARDS'
   | 'GAME_ACTION' 
   | 'LEAVE_GAME' 
   | 'GAME_CREATED' 
   | 'GAME_JOINED' 
-  | 'GAME_STARTED' 
-  | 'GAME_LEFT' 
+  | 'GAME_STARTED'
+  | 'CARD_DRAWN'
+  | 'CARD_REPLACED'
+  | 'CARD_DISCARDED'
+  | 'CABO_CALLED'
+  | 'CARD_PEEKED'
+  | 'OPPONENT_CARD_PEEKED'
+  | 'CARDS_SWITCHED'
+  | 'GAME_LEFT'
+  | 'PLAYER_LEFT'
   | 'ERROR';
 
 interface ServerMessage {
@@ -56,223 +78,64 @@ interface ServerMessage {
   message?: string;
   playerName?: string;
   playerId?: string;
+  drawnCard?: Card;
+  card?: Card;
+  cardIndex?: number;
+  opponentId?: string;
+  callerName?: string;
 }
 
-// Global game storage that persists across component instances
-const globalGameStorage = new Map<string, Game>();
+// Configuration for WebSocket connection
+const WS_URL = 'ws://localhost:8080';
 
-// Global event emitter for cross-component communication
-class GameEventEmitter {
-  private listeners: { [key: string]: Array<(data: any) => void> } = {};
-
-  on(event: string, callback: (data: any) => void) {
-    if (!this.listeners[event]) {
-      this.listeners[event] = [];
-    }
-    this.listeners[event].push(callback);
-  }
-
-  off(event: string, callback: (data: any) => void) {
-    if (this.listeners[event]) {
-      this.listeners[event] = this.listeners[event].filter(cb => cb !== callback);
-    }
-  }
-
-  emit(event: string, data: any) {
-    if (this.listeners[event]) {
-      this.listeners[event].forEach(callback => callback(data));
-    }
-  }
-}
-
-const gameEventEmitter = new GameEventEmitter();
-
-// Mock WebSocket class with global state synchronization
-class MockWebSocket {
+// Real WebSocket wrapper
+class RealWebSocket {
+  private ws: WebSocket | null = null;
   public onmessage: ((event: { data: string }) => void) | null = null;
-  private instanceId: string;
+  private messageQueue: string[] = [];
 
   constructor() {
-    this.instanceId = Math.random().toString(36);
-    
-    // Listen for global game updates
-    gameEventEmitter.on('gameUpdated', (data) => {
-      // Don't send update back to the instance that created it
-      if (data.sourceInstanceId !== this.instanceId && this.onmessage) {
-        this.onmessage({
-          data: JSON.stringify(data.message)
-        });
-      }
-    });
+    this.connect();
+  }
+
+  private connect(): void {
+    try {
+      this.ws = new WebSocket(WS_URL);
+      
+      this.ws.onopen = () => {
+        console.log('Connected to server');
+        while (this.messageQueue.length > 0) {
+          const msg = this.messageQueue.shift();
+          if (msg && this.ws) {
+            this.ws.send(msg);
+          }
+        }
+      };
+
+      this.ws.onmessage = (event) => {
+        if (this.onmessage) {
+          this.onmessage({ data: event.data });
+        }
+      };
+
+      this.ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+      };
+
+      this.ws.onclose = () => {
+        console.log('Disconnected from server');
+        setTimeout(() => this.connect(), 3000);
+      };
+    } catch (error) {
+      console.error('Failed to connect to WebSocket server:', error);
+    }
   }
 
   send(data: string): void {
-    const message: ServerMessage = JSON.parse(data);
-    setTimeout(() => this.handleMessage(message), 100);
-  }
-
-  private broadcastUpdate(message: ServerMessage): void {
-    gameEventEmitter.emit('gameUpdated', {
-      message,
-      sourceInstanceId: this.instanceId
-    });
-  }
-
-  private handleMessage(message: ServerMessage): void {
-    switch (message.type) {
-      case 'CREATE_GAME':
-        this.createGame(message);
-        break;
-      case 'JOIN_GAME':
-        this.joinGame(message);
-        break;
-      case 'START_GAME':
-        this.startGame(message);
-        break;
-      case 'LEAVE_GAME':
-        this.leaveGame(message);
-        break;
-    }
-  }
-
-  private createGame(message: ServerMessage): void {
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const game: Game = {
-      code: code,
-      host: message.playerId!,
-      players: [{
-        id: message.playerId!,
-        name: message.playerName!,
-        isHost: true,
-        cards: [],
-        score: 0,
-        canSeeCorners: false
-      }],
-      state: 'lobby',
-      currentTurn: 0,
-      deck: [],
-      discardPile: [],
-      round: 1
-    };
-    
-    globalGameStorage.set(code, game);
-
-    const response = {
-      type: 'GAME_CREATED' as MessageType,
-      gameCode: code,
-      game: game
-    };
-
-    this.sendMessage(response);
-    this.broadcastUpdate(response);
-  }
-
-  private joinGame(message: ServerMessage): void {
-    const game = globalGameStorage.get(message.gameCode!);
-    if (!game) {
-      this.sendMessage({
-        type: 'ERROR',
-        message: 'Game not found'
-      });
-      return;
-    }
-
-    if (game.players.length >= 8) {
-      this.sendMessage({
-        type: 'ERROR',
-        message: 'Game is full'
-      });
-      return;
-    }
-
-    if (game.players.some(p => p.name === message.playerName)) {
-      this.sendMessage({
-        type: 'ERROR',
-        message: 'Player name already taken in this game'
-      });
-      return;
-    }
-
-    game.players.push({
-      id: message.playerId!,
-      name: message.playerName!,
-      isHost: false,
-      cards: [],
-      score: 0,
-      canSeeCorners: false
-    });
-
-    globalGameStorage.set(message.gameCode!, game);
-
-    const response = {
-      type: 'GAME_JOINED' as MessageType,
-      game: game
-    };
-
-    this.sendMessage(response);
-    this.broadcastUpdate(response);
-  }
-
-  private startGame(message: ServerMessage): void {
-    const game = globalGameStorage.get(message.gameCode!);
-    if (!game || game.players.length < 2) return;
-
-    game.state = 'playing';
-    game.deck = this.createDeck();
-    game.discardPile = [game.deck.pop()!];
-
-    game.players.forEach(player => {
-      player.cards = [
-        game.deck.pop()!,
-        game.deck.pop()!,
-        game.deck.pop()!,
-        game.deck.pop()!
-      ];
-      player.score = 0;
-      player.canSeeCorners = true;
-    });
-
-    globalGameStorage.set(message.gameCode!, game);
-
-    const response = {
-      type: 'GAME_STARTED' as MessageType,
-      game: game
-    };
-
-    this.sendMessage(response);
-    this.broadcastUpdate(response);
-  }
-
-  private createDeck(): Card[] {
-    const suits: Card['suit'][] = ['♠', '♥', '♦', '♣'];
-    const values: Card['value'][] = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-    const deck: Card[] = [];
-
-    suits.forEach(suit => {
-      values.forEach(value => {
-        deck.push({ suit, value });
-      });
-    });
-
-    for (let i = deck.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [deck[i], deck[j]] = [deck[j], deck[i]];
-    }
-
-    return deck;
-  }
-
-  private leaveGame(message: ServerMessage): void {
-    const response = { type: 'GAME_LEFT' as MessageType };
-    this.sendMessage(response);
-    this.broadcastUpdate(response);
-  }
-
-  private sendMessage(message: ServerMessage): void {
-    if (this.onmessage) {
-      this.onmessage({
-        data: JSON.stringify(message)
-      });
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    } else {
+      this.messageQueue.push(data);
     }
   }
 }
@@ -393,12 +256,12 @@ const MenuScreen: React.FC<{
       </div>
       
       <div style={{ background: '#e6fffa', padding: '15px', borderRadius: '10px', fontSize: '14px', color: '#234e52' }}>
-        <strong>Debug Info:</strong> Active games: {globalGameStorage.size}
-        {globalGameStorage.size > 0 && (
-          <div>Game codes: {Array.from(globalGameStorage.keys()).join(', ')}</div>
-        )}
+        <strong>🌐 Multiplayer Ready!</strong> Create a game and share the code with friends.
         <div style={{ marginTop: '10px', fontSize: '12px' }}>
-          💡 <strong>Testing Tip:</strong> Open multiple browser tabs/windows and they should share the same game state!
+          💡 <strong>How to play:</strong> Open this game in different browsers/tabs, use the same game code to join!
+        </div>
+        <div style={{ marginTop: '5px', fontSize: '12px', color: '#2c7a7b' }}>
+          ⚙️ Requires WebSocket server running on ws://localhost:8080
         </div>
       </div>
     </div>
@@ -456,32 +319,97 @@ const LobbyScreen: React.FC<{
 const GameScreen: React.FC<{
   game: Game;
   playerId: string;
+  drawnCard: Card | null;
+  peekedCards: Map<string, Card>;
+  showSpecialPowerMenu: boolean;
   onDrawCard: () => void;
   onTakeDiscard: () => void;
+  onReplaceCard: (cardIndex: number) => void;
+  onDiscardDrawn: () => void;
   onCallCabo: () => void;
-  onUseSpecialPower: () => void;
+  onPeekOwnCard: (cardIndex: number) => void;
+  onPeekOpponentCard: (opponentId: string, cardIndex: number) => void;
+  onSwitchCards: (opponentId: string, playerCardIndex: number, opponentCardIndex: number) => void;
+  onToggleSpecialPowerMenu: () => void;
   onLeaveGame: () => void;
-}> = ({ game, playerId, onDrawCard, onTakeDiscard, onCallCabo, onUseSpecialPower, onLeaveGame }) => {
+}> = ({ 
+  game, 
+  playerId, 
+  drawnCard, 
+  peekedCards,
+  showSpecialPowerMenu,
+  onDrawCard, 
+  onTakeDiscard, 
+  onReplaceCard,
+  onDiscardDrawn,
+  onCallCabo, 
+  onPeekOwnCard,
+  onPeekOpponentCard,
+  onSwitchCards,
+  onToggleSpecialPowerMenu,
+  onLeaveGame 
+}) => {
   const currentPlayer = game.players.find(p => p.id === playerId);
   const topDiscard = game.discardPile[game.discardPile.length - 1];
+  const isMyTurn = game.currentPlayerId === playerId;
 
   return (
     <div className="card">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap' }}>
-        <div>Game Code: {game.code}</div>
-        <div>Turn: {game.players[game.currentTurn]?.name || ''}</div>
-        <div>Round: {game.round}</div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '10px' }}>
+        <div>Game Code: <strong>{game.code}</strong></div>
+        <div>Turn: <strong>{game.players.find(p => p.id === game.currentPlayerId)?.name || ''}</strong></div>
+        <div>Round: <strong>{game.round}</strong></div>
       </div>
 
-      <div style={{ textAlign: 'center', padding: '15px', background: '#e6fffa', border: '2px solid #38b2ac', borderRadius: '10px', margin: '20px 0', fontWeight: 'bold', color: '#234e52' }}>
-        Look at your corner cards to start!
-      </div>
+      {game.caboCallerId && (
+        <div style={{ textAlign: 'center', padding: '15px', background: '#fff5f5', border: '2px solid #fc8181', borderRadius: '10px', margin: '20px 0', fontWeight: 'bold', color: '#c53030' }}>
+          🎺 CABO called by {game.players.find(p => p.id === game.caboCallerId)?.name}! Everyone gets one more turn!
+        </div>
+      )}
+
+      {isMyTurn ? (
+        <div style={{ textAlign: 'center', padding: '15px', background: '#c6f6d5', border: '2px solid #38a169', borderRadius: '10px', margin: '20px 0', fontWeight: 'bold', color: '#22543d' }}>
+          ✨ It's your turn! {drawnCard ? 'Choose a card to replace or discard' : 'Draw a card or take from discard pile'}
+        </div>
+      ) : (
+        <div style={{ textAlign: 'center', padding: '15px', background: '#e6fffa', border: '2px solid #38b2ac', borderRadius: '10px', margin: '20px 0', fontWeight: 'bold', color: '#234e52' }}>
+          Waiting for {game.players.find(p => p.id === game.currentPlayerId)?.name}'s turn...
+        </div>
+      )}
+
+      {/* Drawn Card Display */}
+      {drawnCard && isMyTurn && (
+        <div style={{ textAlign: 'center', margin: '20px 0' }}>
+          <div style={{ fontSize: '18px', marginBottom: '10px', fontWeight: 'bold' }}>You drew:</div>
+          <div 
+            style={{
+              width: '100px',
+              height: '150px',
+              borderRadius: '10px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontWeight: 'bold',
+              fontSize: '24px',
+              background: 'white',
+              border: '3px solid #4299e1',
+              color: isRedCard(drawnCard) ? '#e53e3e' : '#2d3748',
+              boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
+            }}
+          >
+            {getCardDisplay(drawnCard)}
+          </div>
+          <div style={{ marginTop: '10px' }}>
+            <button onClick={onDiscardDrawn}>Discard This Card</button>
+          </div>
+        </div>
+      )}
 
       {/* Deck Area */}
       <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', margin: '30px 0', flexWrap: 'wrap' }}>
         <div style={{ textAlign: 'center' }}>
           <div 
-            onClick={onDrawCard}
+            onClick={isMyTurn && !drawnCard ? onDrawCard : undefined}
             style={{
               width: '80px',
               height: '120px',
@@ -491,19 +419,20 @@ const GameScreen: React.FC<{
               justifyContent: 'center',
               fontWeight: 'bold',
               fontSize: '18px',
-              cursor: 'pointer',
+              cursor: isMyTurn && !drawnCard ? 'pointer' : 'not-allowed',
               marginBottom: '10px',
-              background: 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)',
-              color: 'white'
+              background: isMyTurn && !drawnCard ? 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)' : '#a0aec0',
+              color: 'white',
+              opacity: isMyTurn && !drawnCard ? 1 : 0.6
             }}
           >
             DECK
           </div>
-          <div>Draw Pile</div>
+          <div style={{ fontSize: '12px' }}>{game.deck.length} cards</div>
         </div>
         <div style={{ textAlign: 'center' }}>
           <div 
-            onClick={onTakeDiscard}
+            onClick={isMyTurn && !drawnCard ? onTakeDiscard : undefined}
             style={{
               width: '80px',
               height: '120px',
@@ -513,16 +442,17 @@ const GameScreen: React.FC<{
               justifyContent: 'center',
               fontWeight: 'bold',
               fontSize: '18px',
-              cursor: 'pointer',
+              cursor: isMyTurn && !drawnCard ? 'pointer' : 'not-allowed',
               marginBottom: '10px',
               background: 'white',
-              border: '2px solid #2d3748',
-              color: isRedCard(topDiscard) ? '#e53e3e' : '#2d3748'
+              border: `2px solid ${isMyTurn && !drawnCard ? '#2d3748' : '#cbd5e0'}`,
+              color: topDiscard && isRedCard(topDiscard) ? '#e53e3e' : '#2d3748',
+              opacity: isMyTurn && !drawnCard ? 1 : 0.6
             }}
           >
             {topDiscard ? getCardDisplay(topDiscard) : '-'}
           </div>
-          <div>Discard Pile</div>
+          <div style={{ fontSize: '12px' }}>Discard Pile</div>
         </div>
       </div>
 
@@ -530,54 +460,65 @@ const GameScreen: React.FC<{
       <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap', margin: '20px 0' }}>
         <button 
           onClick={onCallCabo}
+          disabled={!isMyTurn || !!game.caboCallerId}
           style={{
-            background: 'linear-gradient(135deg, #ffd89b 0%, #19547b 100%)',
+            background: game.caboCallerId ? '#cbd5e0' : 'linear-gradient(135deg, #ffd89b 0%, #19547b 100%)',
             fontSize: '18px',
             padding: '20px 40px'
           }}
         >
-          Call CABO!
-        </button>
-        <button 
-          onClick={onUseSpecialPower}
-          style={{ background: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)' }}
-        >
-          Use Special Power
+          {game.caboCallerId ? 'CABO Called' : 'Call CABO!'}
         </button>
       </div>
 
       {/* Players Area */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px', margin: '20px 0' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '15px', margin: '20px 0' }}>
         {game.players.map((player) => {
           const isCurrentPlayer = player.id === playerId;
+          const isPlayerTurn = player.id === game.currentPlayerId;
           return (
             <div 
               key={player.id}
               style={{
-                background: isCurrentPlayer ? '#edf2f7' : '#f7fafc',
+                background: isPlayerTurn ? '#fef5e7' : (isCurrentPlayer ? '#edf2f7' : '#f7fafc'),
                 padding: '15px',
                 borderRadius: '10px',
-                border: `2px solid ${isCurrentPlayer ? '#667eea' : '#e2e8f0'}`
+                border: `3px solid ${isPlayerTurn ? '#f59e0b' : (isCurrentPlayer ? '#667eea' : '#e2e8f0')}`
               }}
             >
-              <div><strong>{player.name}</strong> {isCurrentPlayer && '(You)'}</div>
-              <div style={{ display: 'flex', gap: '10px', margin: '10px 0', flexWrap: 'wrap' }}>
+              <div style={{ marginBottom: '10px', fontWeight: 'bold' }}>
+                {player.name} {isCurrentPlayer && '(You)'} {isPlayerTurn && '🎯'}
+              </div>
+              <div style={{ display: 'flex', gap: '8px', margin: '10px 0', flexWrap: 'wrap', justifyContent: 'center' }}>
                 {player.cards.map((card, cardIndex) => {
                   let cardContent = '?';
                   let isVisible = false;
                   let cardColor = '#2d3748';
+                  const peekKey = `${player.id}-${cardIndex}`;
+                  const peekedCard = peekedCards.get(peekKey);
 
                   if (isCurrentPlayer) {
                     if (player.canSeeCorners && (cardIndex === 0 || cardIndex === 3)) {
                       cardContent = getCardDisplay(card);
                       isVisible = true;
                       cardColor = isRedCard(card) ? '#e53e3e' : '#2d3748';
+                    } else if (peekedCard) {
+                      cardContent = getCardDisplay(peekedCard);
+                      isVisible = true;
+                      cardColor = isRedCard(peekedCard) ? '#e53e3e' : '#2d3748';
                     }
+                  } else if (peekedCard) {
+                    cardContent = getCardDisplay(peekedCard);
+                    isVisible = true;
+                    cardColor = isRedCard(peekedCard) ? '#e53e3e' : '#2d3748';
                   }
+
+                  const canReplace = isMyTurn && drawnCard && isCurrentPlayer;
 
                   return (
                     <div 
                       key={cardIndex}
+                      onClick={() => canReplace && onReplaceCard(cardIndex)}
                       style={{
                         width: '60px',
                         height: '90px',
@@ -586,22 +527,41 @@ const GameScreen: React.FC<{
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        background: isVisible ? 'white' : (isCurrentPlayer ? 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)' : '#f7fafc'),
-                        cursor: 'pointer',
+                        background: isVisible ? 'white' : (isCurrentPlayer ? 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)' : '#e2e8f0'),
+                        cursor: canReplace ? 'pointer' : 'default',
                         fontWeight: 'bold',
                         fontSize: '14px',
-                        color: isVisible ? cardColor : (isCurrentPlayer ? 'white' : '#2d3748')
+                        color: isVisible ? cardColor : (isCurrentPlayer ? 'white' : '#718096'),
+                        transition: 'transform 0.2s',
+                        boxShadow: canReplace ? '0 2px 8px rgba(0,0,0,0.2)' : 'none'
                       }}
+                      onMouseEnter={(e) => canReplace && (e.currentTarget.style.transform = 'scale(1.05)')}
+                      onMouseLeave={(e) => canReplace && (e.currentTarget.style.transform = 'scale(1)')}
                     >
                       {cardContent}
                     </div>
                   );
                 })}
               </div>
-              <div>Score: {player.score}</div>
+              {game.state === 'finished' && (
+                <div style={{ marginTop: '10px', fontWeight: 'bold', color: '#2d3748' }}>
+                  Final Score: {player.score}
+                </div>
+              )}
             </div>
           );
         })}
+      </div>
+
+      {/* Special Powers Info */}
+      <div style={{ background: '#f7fafc', padding: '15px', borderRadius: '10px', margin: '20px 0', fontSize: '13px' }}>
+        <strong>💡 Tip:</strong> When you discard 6/7/8/9/10/J/Q/K, you can use their special powers!
+        <div style={{ marginTop: '8px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '5px' }}>
+          <div>6,7: Peek at your own card</div>
+          <div>8,9: Peek at opponent's card</div>
+          <div>10,J: Blind swap with opponent</div>
+          <div>Q,Black K: Peek & choose to swap</div>
+        </div>
       </div>
 
       <div style={{ textAlign: 'center' }}>
@@ -612,14 +572,57 @@ const GameScreen: React.FC<{
 };
 
 const GameOverScreen: React.FC<{
+  game: Game;
   onPlayAgain: () => void;
   onBackToMenu: () => void;
-}> = ({ onPlayAgain, onBackToMenu }) => {
+}> = ({ game, onPlayAgain, onBackToMenu }) => {
+  const sortedPlayers = [...game.players].sort((a, b) => a.score - b.score);
+  const winner = sortedPlayers[0];
+
   return (
     <div className="card">
-      <h2>Game Over!</h2>
-      <div id="final-scores">Final scores would be displayed here</div>
-      <div style={{ textAlign: 'center' }}>
+      <h2 style={{ textAlign: 'center', marginBottom: '20px' }}>🎉 Game Over! 🎉</h2>
+      
+      <div style={{ textAlign: 'center', padding: '20px', background: '#fef5e7', border: '3px solid #f59e0b', borderRadius: '10px', margin: '20px 0' }}>
+        <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#92400e', marginBottom: '10px' }}>
+          🏆 Winner: {winner.name} 🏆
+        </div>
+        <div style={{ fontSize: '18px', color: '#78350f' }}>
+          Score: {winner.score}
+        </div>
+      </div>
+
+      <div style={{ margin: '20px 0' }}>
+        <h3 style={{ marginBottom: '15px', textAlign: 'center' }}>Final Scores</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          {sortedPlayers.map((player, index) => (
+            <div 
+              key={player.id}
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '15px',
+                background: index === 0 ? '#fef3c7' : '#f7fafc',
+                border: `2px solid ${index === 0 ? '#f59e0b' : '#e2e8f0'}`,
+                borderRadius: '10px'
+              }}
+            >
+              <div>
+                <span style={{ fontWeight: 'bold', marginRight: '10px' }}>
+                  {index + 1}.
+                </span>
+                {player.name}
+              </div>
+              <div style={{ fontWeight: 'bold', fontSize: '18px' }}>
+                {player.score} points
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ textAlign: 'center', marginTop: '30px' }}>
         <button onClick={onPlayAgain}>Play Again</button>
         <button onClick={onBackToMenu}>Back to Menu</button>
       </div>
@@ -637,10 +640,12 @@ const CaboCardGame: React.FC = () => {
     isHost: false,
     currentGame: null,
     selectedCard: null,
-    drawnCard: null
+    drawnCard: null,
+    peekedCards: new Map(),
+    showSpecialPowerMenu: false
   });
 
-  const [ws] = useState(() => new MockWebSocket());
+  const [ws] = useState(() => new RealWebSocket());
 
   useEffect(() => {
     ws.onmessage = (event) => {
@@ -672,7 +677,75 @@ const CaboCardGame: React.FC = () => {
         setGameState(prev => ({
           ...prev,
           currentGame: message.game!,
-          screen: 'game'
+          screen: 'game',
+          peekedCards: new Map()
+        }));
+        break;
+
+      case 'CARD_DRAWN':
+        setGameState(prev => ({
+          ...prev,
+          currentGame: message.game!,
+          drawnCard: message.playerId === prev.playerId ? message.drawnCard! : prev.drawnCard
+        }));
+        break;
+
+      case 'CARD_REPLACED':
+      case 'CARD_DISCARDED':
+        setGameState(prev => ({
+          ...prev,
+          currentGame: message.game!,
+          drawnCard: null
+        }));
+        if (message.game!.state === 'finished') {
+          setGameState(prev => ({ ...prev, screen: 'game-over' }));
+        }
+        break;
+
+      case 'CABO_CALLED':
+        setGameState(prev => ({
+          ...prev,
+          currentGame: message.game!
+        }));
+        alert(`${message.callerName} called CABO! Everyone gets one more turn!`);
+        break;
+
+      case 'CARD_PEEKED':
+        setGameState(prev => {
+          const newPeekedCards = new Map(prev.peekedCards);
+          newPeekedCards.set(`${prev.playerId}-${message.cardIndex}`, message.card!);
+          return {
+            ...prev,
+            peekedCards: newPeekedCards
+          };
+        });
+        alert(`You peeked at your card: ${getCardDisplay(message.card!)}`);
+        break;
+
+      case 'OPPONENT_CARD_PEEKED':
+        setGameState(prev => {
+          const newPeekedCards = new Map(prev.peekedCards);
+          newPeekedCards.set(`${message.opponentId}-${message.cardIndex}`, message.card!);
+          return {
+            ...prev,
+            peekedCards: newPeekedCards
+          };
+        });
+        alert(`You peeked at opponent's card: ${getCardDisplay(message.card!)}`);
+        break;
+
+      case 'CARDS_SWITCHED':
+        setGameState(prev => ({
+          ...prev,
+          currentGame: message.game!
+        }));
+        alert('Cards have been switched!');
+        break;
+
+      case 'PLAYER_LEFT':
+        setGameState(prev => ({
+          ...prev,
+          currentGame: message.game!
         }));
         break;
 
@@ -743,28 +816,94 @@ const CaboCardGame: React.FC = () => {
       isHost: false,
       currentGame: null,
       selectedCard: null,
-      drawnCard: null
+      drawnCard: null,
+      peekedCards: new Map(),
+      showSpecialPowerMenu: false
     });
   };
 
   const handleDrawCard = () => {
-    alert('Draw card functionality - would draw from deck');
+    ws.send(JSON.stringify({
+      type: 'DRAW_CARD',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId
+    }));
   };
 
   const handleTakeDiscard = () => {
-    alert('Take discard functionality - would take top discard card');
+    ws.send(JSON.stringify({
+      type: 'TAKE_DISCARD',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId
+    }));
+  };
+
+  const handleReplaceCard = (cardIndex: number) => {
+    ws.send(JSON.stringify({
+      type: 'REPLACE_CARD',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId,
+      cardIndex
+    }));
+  };
+
+  const handleDiscardDrawn = () => {
+    ws.send(JSON.stringify({
+      type: 'DISCARD_DRAWN',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId
+    }));
   };
 
   const handleCallCabo = () => {
-    alert('Cabo called! All other players get one more turn.');
+    if (window.confirm('Are you sure you want to call CABO? Everyone will get one more turn!')) {
+      ws.send(JSON.stringify({
+        type: 'CALL_CABO',
+        gameCode: gameState.gameCode,
+        playerId: gameState.playerId
+      }));
+    }
   };
 
-  const handleUseSpecialPower = () => {
-    alert('Special power functionality - based on card played');
+  const handlePeekOwnCard = (cardIndex: number) => {
+    ws.send(JSON.stringify({
+      type: 'PEEK_OWN_CARD',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId,
+      cardIndex
+    }));
+  };
+
+  const handlePeekOpponentCard = (opponentId: string, cardIndex: number) => {
+    ws.send(JSON.stringify({
+      type: 'PEEK_OPPONENT_CARD',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId,
+      opponentId,
+      cardIndex
+    }));
+  };
+
+  const handleSwitchCards = (opponentId: string, playerCardIndex: number, opponentCardIndex: number) => {
+    ws.send(JSON.stringify({
+      type: 'SWITCH_CARDS',
+      gameCode: gameState.gameCode,
+      playerId: gameState.playerId,
+      opponentId,
+      playerCardIndex,
+      opponentCardIndex
+    }));
+  };
+
+  const handleToggleSpecialPowerMenu = () => {
+    setGameState(prev => ({
+      ...prev,
+      showSpecialPowerMenu: !prev.showSpecialPowerMenu
+    }));
   };
 
   const handlePlayAgain = () => {
-    alert('Play again functionality');
+    alert('Play again functionality - would reset the game');
   };
 
   return (
@@ -852,16 +991,25 @@ const CaboCardGame: React.FC = () => {
           <GameScreen 
             game={gameState.currentGame}
             playerId={gameState.playerId}
+            drawnCard={gameState.drawnCard}
+            peekedCards={gameState.peekedCards}
+            showSpecialPowerMenu={gameState.showSpecialPowerMenu}
             onDrawCard={handleDrawCard}
             onTakeDiscard={handleTakeDiscard}
+            onReplaceCard={handleReplaceCard}
+            onDiscardDrawn={handleDiscardDrawn}
             onCallCabo={handleCallCabo}
-            onUseSpecialPower={handleUseSpecialPower}
+            onPeekOwnCard={handlePeekOwnCard}
+            onPeekOpponentCard={handlePeekOpponentCard}
+            onSwitchCards={handleSwitchCards}
+            onToggleSpecialPowerMenu={handleToggleSpecialPowerMenu}
             onLeaveGame={handleLeaveGame}
           />
         )}
 
-        {gameState.screen === 'game-over' && (
+        {gameState.screen === 'game-over' && gameState.currentGame && (
           <GameOverScreen 
+            game={gameState.currentGame}
             onPlayAgain={handlePlayAgain}
             onBackToMenu={handleBackToMenu}
           />
